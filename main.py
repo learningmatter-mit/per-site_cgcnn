@@ -1,270 +1,335 @@
 import argparse
+import torch
 import os
-import shutil
 import sys
-import time
 import warnings
 from random import sample
-
+import pickle as pkl
 import numpy as np
-import torch
+import time
+import shutil
+from tqdm import tqdm
+
 import torch.nn as nn
 import torch.optim as optim
-from sklearn import metrics
-from torch.autograd import Variable
 from torch.optim.lr_scheduler import MultiStepLR
 
-from cgcnn.data import CIFData
-from cgcnn.data import collate_pool, get_train_val_test_loader
-from cgcnn.model import CrystalGraphConvNet
+import matplotlib.pyplot as plt
+import shutil
+from matplotlib import colors
+from sklearn.metrics import mean_absolute_error
+from scipy.stats import pearsonr
+import seaborn as sns
 
-parser = argparse.ArgumentParser(description='Crystal Graph Convolutional Neural Networks')
-parser.add_argument('data_options', metavar='OPTIONS', nargs='+',
-                    help='dataset options, started with the path to root dir, '
-                         'then other options')
-parser.add_argument('--task', choices=['regression', 'classification'],
-                    default='regression', help='complete a regression or '
-                                                   'classification task (default: regression)')
-parser.add_argument('--disable-cuda', action='store_true',
-                    help='Disable CUDA')
-parser.add_argument('-j', '--workers', default=0, type=int, metavar='N',
-                    help='number of data loading workers (default: 0)')
-parser.add_argument('--epochs', default=30, type=int, metavar='N',
-                    help='number of total epochs to run (default: 30)')
-parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
-                    help='manual epoch number (useful on restarts)')
-parser.add_argument('-b', '--batch-size', default=256, type=int,
-                    metavar='N', help='mini-batch size (default: 256)')
-parser.add_argument('--lr', '--learning-rate', default=0.01, type=float,
-                    metavar='LR', help='initial learning rate (default: '
-                                       '0.01)')
-parser.add_argument('--lr-milestones', default=[100], nargs='+', type=int,
-                    metavar='N', help='milestones for scheduler (default: '
-                                      '[100])')
-parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
-                    help='momentum')
-parser.add_argument('--weight-decay', '--wd', default=0, type=float,
-                    metavar='W', help='weight decay (default: 0)')
-parser.add_argument('--print-freq', '-p', default=10, type=int,
-                    metavar='N', help='print frequency (default: 10)')
-parser.add_argument('--resume', default='', type=str, metavar='PATH',
-                    help='path to latest checkpoint (default: none)')
-train_group = parser.add_mutually_exclusive_group()
-train_group.add_argument('--train-ratio', default=None, type=float, metavar='N',
-                    help='number of training data to be loaded (default none)')
-train_group.add_argument('--train-size', default=None, type=int, metavar='N',
-                         help='number of training data to be loaded (default none)')
-valid_group = parser.add_mutually_exclusive_group()
-valid_group.add_argument('--val-ratio', default=0.1, type=float, metavar='N',
-                    help='percentage of validation data to be loaded (default '
-                         '0.1)')
-valid_group.add_argument('--val-size', default=None, type=int, metavar='N',
-                         help='number of validation data to be loaded (default '
-                              '1000)')
-test_group = parser.add_mutually_exclusive_group()
-test_group.add_argument('--test-ratio', default=0.1, type=float, metavar='N',
-                    help='percentage of test data to be loaded (default 0.1)')
-test_group.add_argument('--test-size', default=None, type=int, metavar='N',
-                        help='number of test data to be loaded (default 1000)')
+import matplotlib as mpl
+import matplotlib.cm as cm
+import matplotlib.colors as mcolors
 
-parser.add_argument('--optim', default='SGD', type=str, metavar='SGD',
-                    help='choose an optimizer, SGD or Adam, (default: SGD)')
-parser.add_argument('--atom-fea-len', default=64, type=int, metavar='N',
-                    help='number of hidden atom features in conv layers')
-parser.add_argument('--h-fea-len', default=128, type=int, metavar='N',
-                    help='number of hidden features after pooling')
-parser.add_argument('--n-conv', default=3, type=int, metavar='N',
-                    help='number of conv layers')
-parser.add_argument('--n-h', default=1, type=int, metavar='N',
-                    help='number of hidden layers after pooling')
+from per_site_cgcnn.data import PerSiteData
+from per_site_cgcnn.data import collate_pool, get_train_val_test_loader
+from per_site_cgcnn.model import PerSiteCGCNet#, BindingEnergyCGCNet 
 
-args = parser.parse_args(sys.argv[1:])
+#sys.path.append("../utils")
+#from utils import *
+#from surface_analyzer import *
 
-args.cuda = not args.disable_cuda and torch.cuda.is_available()
+import sigopt
 
-if args.task == 'regression':
-    best_mae_error = 1e10
-else:
-    best_mae_error = 0.
+os.environ["CUDA_VISIBLE_DEVICES"] = str(2)
+assert torch.cuda.is_available(), "cuda is not available"
 
+WORKDIR = os.getcwd()
+best_mae_error = 1e10
 
-def main():
-    global args, best_mae_error
+#t_seed = random.randint(0,1000)
+#t_seed = 0
 
-    # load data
-    dataset = CIFData(*args.data_options)
-    collate_fn = collate_pool
-    train_loader, val_loader, test_loader = get_train_val_test_loader(
-        dataset=dataset,
-        collate_fn=collate_fn,
-        batch_size=args.batch_size,
-        train_ratio=args.train_ratio,
-        num_workers=args.workers,
-        val_ratio=args.val_ratio,
-        test_ratio=args.test_ratio,
-        pin_memory=args.cuda,
-        train_size=args.train_size,
-        val_size=args.val_size,
-        test_size=args.test_size,
-        return_test=True)
+def set_seed(seed: int = 42) -> None:
+    np.random.seed(seed)
+    #random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    # When running on the CuDNN backend, two further options must be set
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    # Set a fixed value for the hash seed
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    print(f"Random seed set as {seed}")
 
-    # obtain target value normalizer
-    if args.task == 'classification':
-        normalizer = Normalizer(torch.zeros(2))
-        normalizer.load_state_dict({'mean': 0., 'std': 1.})
+    
+device = 'cuda'
+
+class Args():
+
+    def __init__(self, 
+            data = "data/all_combined.pkl",
+            site_prop = ['magmom','bader','bandcenter'], 
+            data_cache = "dataset_cache",
+            workers = 0,
+            epochs = 157,
+            start_epoch = 0,
+            batch_size = 64,
+            lr = 0.00363,
+            lr_milestones = 100,
+            momentum = 0.9,
+            weight_decay = 0,
+            print_freq = 10,
+            resume = "",
+            train_ratio = 0.6,
+            val_ratio = 0.2,
+            test_ratio = 0.2, 
+            optim = "Adam",
+            atom_fea_len = 178,
+            h_fea_len = 223,
+            n_conv = 3,
+            n_h = 2,
+            sched = "Multi-step scheduler",
+            lr_update_rate = 30,
+            seed = 83,
+            ):
+
+        self.data = data
+        self.site_prop = site_prop
+        self.data_cache = data_cache
+        self.workers = workers
+        self.epochs = epochs
+        self.start_epoch = start_epoch
+        self.batch_size = batch_size
+        self.lr = lr
+        self.lr_milestones = lr_milestones
+        self.momentum = momentum
+        self.weight_decay = weight_decay
+        self.print_freq = print_freq
+        self.resume = resume
+        self.train_ratio = train_ratio
+        self.val_ratio = val_ratio
+        self.test_ratio = test_ratio
+        self.optim = optim
+        self.atom_fea_len = atom_fea_len
+        self.h_fea_len = h_fea_len
+        self.n_conv = n_conv
+        self.n_h = n_h
+        self.sched = sched
+        self.lr_update_rate = lr_update_rate
+        self.seed = seed
+
+def flatten(t):
+    return [item for sublist in t for item in sublist]
+
+def plot_hexbin(targ, pred, key, title="", scale="linear", 
+                inc_factor = 1.1, dec_factor = 0.9,
+                bins=None, plot_helper_lines=False,
+                cmap='viridis'):
+    
+    props = {
+        'center_diff': 'B 3d $-$ O 2p difference',
+        'op': 'O 2p $-$ $E_v$',
+        'form_e': 'formation energy',
+        'e_hull': 'energy above hull',
+        'tot_e': 'energy per atom',
+        'time': 'runtime',
+        'magmom': 'magnetic moment',
+        'magmom_abs': 'magnetic moment',
+        'ads_e': 'adsorption energy',
+        'acid_stab': 'electrochemical stability',
+        'bandcenter': 'DOS band center',
+        'phonon': 'atomic vibration frequency',
+        'bader': 'Bader charge'
+    }
+    
+    units = {
+        'center_diff': 'eV',
+        'op': 'eV',
+        'form_e': 'eV',
+        'e_hull': 'eV/atom',
+        'tot_e': 'eV/atom',
+        'time': 's',
+        'magmom': '$\mu_B$',
+        'magmom_abs': '|$\mu_B$|',
+        'ads_e': 'eV',
+        'acid_stab': 'eV/atom',
+        'bandcenter': 'eV',
+        'phonon': 'THz',
+        'bader': '$q_e$'
+    }
+    
+    fig, ax = plt.subplots(figsize=(6,6))
+    
+    mae = mean_absolute_error(targ, pred)
+    r, _ = pearsonr(targ, pred)
+    
+    if scale == 'log':
+        pred = np.abs(pred) + 1e-8
+        targ = np.abs(targ) + 1e-8
+        
+    lim_min = min(np.min(pred), np.min(targ))
+    if lim_min < 0:
+        if lim_min > -0.1:
+            lim_min = -0.1
+        lim_min *= inc_factor
     else:
-        if len(dataset) < 500:
-            warnings.warn('Dataset has less than 500 data points. '
-                          'Lower accuracy is expected. ')
-            sample_data_list = [dataset[i] for i in range(len(dataset))]
-        else:
-            sample_data_list = [dataset[i] for i in
-                                sample(range(len(dataset)), 500)]
-        _, sample_target, _ = collate_pool(sample_data_list)
-        normalizer = Normalizer(sample_target)
-
-    # build model
-    structures, _, _ = dataset[0]
-    orig_atom_fea_len = structures[0].shape[-1]
-    nbr_fea_len = structures[1].shape[-1]
-    model = CrystalGraphConvNet(orig_atom_fea_len, nbr_fea_len,
-                                atom_fea_len=args.atom_fea_len,
-                                n_conv=args.n_conv,
-                                h_fea_len=args.h_fea_len,
-                                n_h=args.n_h,
-                                classification=True if args.task ==
-                                                       'classification' else False)
-    if args.cuda:
-        model.cuda()
-
-    # define loss func and optimizer
-    if args.task == 'classification':
-        criterion = nn.NLLLoss()
+        if lim_min < 0.1:
+            lim_min = -0.1
+        lim_min *= dec_factor
+    lim_max = max(np.max(pred), np.max(targ))
+    if lim_max <= 0:
+        if lim_max > -0.1:
+            lim_max = 0.2
+        lim_max *= dec_factor
     else:
-        criterion = nn.MSELoss()
-    if args.optim == 'SGD':
-        optimizer = optim.SGD(model.parameters(), args.lr,
-                              momentum=args.momentum,
-                              weight_decay=args.weight_decay)
-    elif args.optim == 'Adam':
-        optimizer = optim.Adam(model.parameters(), args.lr,
-                               weight_decay=args.weight_decay)
-    else:
-        raise NameError('Only SGD or Adam is allowed as --optim')
+        if lim_max < 0.1:
+            lim_max = 0.25
+        lim_max *= inc_factor
+        
+    ax.set_xlim(lim_min, lim_max)
+    ax.set_ylim(lim_min, lim_max)
+    ax.set_aspect('equal')
 
-    # optionally resume from a checkpoint
-    if args.resume:
-        if os.path.isfile(args.resume):
-            print("=> loading checkpoint '{}'".format(args.resume))
-            checkpoint = torch.load(args.resume)
-            args.start_epoch = checkpoint['epoch']
-            best_mae_error = checkpoint['best_mae_error']
-            model.load_state_dict(checkpoint['state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            normalizer.load_state_dict(checkpoint['normalizer'])
-            print("=> loaded checkpoint '{}' (epoch {})"
-                  .format(args.resume, checkpoint['epoch']))
-        else:
-            print("=> no checkpoint found at '{}'".format(args.resume))
+    #ax.plot((lim_min, lim_max),
+    #        (lim_min, lim_max),
+    #        color='#000000',
+    #        zorder=-1,
+    #        linewidth=0.5)
+    ax.axline((0, 0), (1, 1),
+           color='#000000',
+           zorder=-1,
+           linewidth=0.5)
+       
+    hb = ax.hexbin(
+        targ, pred,
+        cmap=cmap,
+        gridsize=60,
+        bins=bins,
+        mincnt=1,
+        edgecolors=None,
+        linewidths=(0.1,),
+        xscale=scale,
+        yscale=scale,
+        extent=(lim_min, lim_max, lim_min, lim_max))
+    
 
-    scheduler = MultiStepLR(optimizer, milestones=args.lr_milestones,
-                            gamma=0.1)
+    cb = fig.colorbar(hb, shrink=0.822)
+    cb.set_label('Count')
 
-    for epoch in range(args.start_epoch, args.epochs):
-        # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, normalizer)
+    if plot_helper_lines:
+        
+        if scale == 'linear':
+            x = np.linspace(lim_min, lim_max, 50)
+            y_up = x + mae
+            y_down = x - mae         
+            
+        elif scale == 'log':
+            x = np.logspace(np.log10(lim_min), np.log10(lim_max), 50)
+            
+            # one order of magnitude
+            y_up = np.maximum(x + 1e-2, x * 10)
+            y_down = np.minimum(np.maximum(1e-8, x - 1e-2), x / 10)
+            
+            # one kcal/mol/Angs
+            y_up = x + 1
+            y_down = np.maximum(1e-8, x - 1)
+            
+        
+        for y in [y_up, y_down]:
+            ax.plot(x,
+                    y,
+                    color='#000000',
+                    zorder=2,
+                    linewidth=0.5,
+                    linestyle='--')
+            
+    ax.set_title(title, fontsize=14)
+    ax.set_ylabel('Predicted %s [%s]' % (props[key], units[key]), fontsize=12)
+    ax.set_xlabel('Calculated %s [%s]' % (props[key], units[key]), fontsize=12)
+    
+    ax.annotate("Pearson's r: %.3f \nMAE: %.3f %s " % (r, mae, units[key]),
+                (0.03, 0.88),
+                xycoords='axes fraction',
+                fontsize=12)
+         
+    return r, mae, ax, hb
 
-        # evaluate on validation set
-        mae_error = validate(val_loader, model, criterion, normalizer)
+def get_val_mae(test_targets, test_preds, test_ids):
 
-        if mae_error != mae_error:
-            print('Exit due to NaN')
-            sys.exit(1)
+    mae = 0
 
-        scheduler.step()
+    for i in [0,1,2,3]:
+    
+        site_targs = []
+        site_preds = []
 
-        # remember the best mae_eror and save checkpoint
-        if args.task == 'regression':
-            is_best = mae_error < best_mae_error
-            best_mae_error = min(mae_error, best_mae_error)
-        else:
-            is_best = mae_error > best_mae_error
-            best_mae_error = max(mae_error, best_mae_error)
-        save_checkpoint({
-            'epoch': epoch + 1,
-            'state_dict': model.state_dict(),
-            'best_mae_error': best_mae_error,
-            'optimizer': optimizer.state_dict(),
-            'normalizer': normalizer.state_dict(),
-            'args': vars(args)
-        }, is_best)
+        for index in tqdm(range(len(test_ids))):
+    
+            id_ = test_ids[index]
+        
+            surface = Surface.objects.filter(id=id_)
+            
+            if surface:
+                surf = surface[0]
+                surface_atoms = np.where(surf.surface_atoms)[0]
+                targ = np.array(test_targets[index])[:,i]
+                pred = np.array(test_preds[index])[:,i]
+                site_targs.append(np.array(targ[surface_atoms]))
+                site_preds.append(np.array(pred[surface_atoms]))
 
-    # test best model
-    print('---------Evaluate Model on Test Set---------------')
-    best_checkpoint = torch.load('model_best.pth.tar')
-    model.load_state_dict(best_checkpoint['state_dict'])
-    validate(test_loader, model, criterion, normalizer, test=True)
+        site_targs = flatten(site_targs)
+        site_preds = flatten(site_preds)
+        indexes = np.where(~np.isnan(np.array(site_targs)))[0]
 
 
-def train(train_loader, model, criterion, optimizer, epoch, normalizer):
+        mae += mean_absolute_error(np.array(site_targs)[indexes], np.array(site_preds)[indexes])
+        _, _, ax1, _ = plot_hexbin(np.array(site_targs)[indexes], np.array(site_preds)[indexes], 'op', bins='log', cmap='gray_r')
+
+        label = 'descriptor'+str(i)
+        ax1.set_xlabel(label)
+        ax1.set_ylabel(label)
+   
+        plt.savefig(label+'.png')
+
+    return mae/4 
+
+def train(train_loader, model, criterion, optimizer, epoch, normalizer, args):
+
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
-    if args.task == 'regression':
-        mae_errors = AverageMeter()
-    else:
-        accuracies = AverageMeter()
-        precisions = AverageMeter()
-        recalls = AverageMeter()
-        fscores = AverageMeter()
-        auc_scores = AverageMeter()
+    mae_errors = AverageMeter()
 
     # switch to train mode
     model.train()
 
     end = time.time()
-    for i, (input, target, _) in enumerate(train_loader):
+    for i, (inputs, target, _) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
 
-        if args.cuda:
-            input_var = (Variable(input[0].cuda(non_blocking=True)),
-                         Variable(input[1].cuda(non_blocking=True)),
-                         input[2].cuda(non_blocking=True),
-                         [crys_idx.cuda(non_blocking=True) for crys_idx in input[3]])
-        else:
-            input_var = (Variable(input[0]),
-                         Variable(input[1]),
-                         input[2],
-                         input[3])
-        # normalize target
-        if args.task == 'regression':
-            target_normed = normalizer.norm(target)
-        else:
-            target_normed = target.view(-1).long()
-        if args.cuda:
-            target_var = Variable(target_normed.cuda(non_blocking=True))
-        else:
-            target_var = Variable(target_normed)
+        input_var = (
+            inputs[0].to(device),
+            inputs[1].to(device),
+            inputs[2].to(device),
+            [crys_idx.to(device) for crys_idx in inputs[3]]
+        )
 
-        # compute output
-        output = model(*input_var)
-        loss = criterion(output, target_var)
+        target_normed = normalizer.norm(target)
+        target_var = target_normed.to(device)
+
+        # Compute output
+        output, atom_fea = model(*input_var)
+        output = torch.cat(output)
+        #atom_fea = torch.cat(atom_fea).data.cpu()
+        target_var = torch.cat([target_var[idx_map] for idx_map in inputs[3]])
+
+        # calculate loss with nans removed
+        output_flatten = torch.flatten(output)
+        target_flatten = torch.flatten(target_var)
+        valid_idx = torch.bitwise_not(torch.isnan(target_flatten))
+
+        loss = criterion(output_flatten[valid_idx], target_flatten[valid_idx])
 
         # measure accuracy and record loss
-        if args.task == 'regression':
-            mae_error = mae(normalizer.denorm(output.data.cpu()), target)
-            losses.update(loss.data.cpu(), target.size(0))
-            mae_errors.update(mae_error, target.size(0))
-        else:
-            accuracy, precision, recall, fscore, auc_score = \
-                class_eval(output.data.cpu(), target)
-            losses.update(loss.data.cpu().item(), target.size(0))
-            accuracies.update(accuracy, target.size(0))
-            precisions.update(precision, target.size(0))
-            recalls.update(recall, target.size(0))
-            fscores.update(fscore, target.size(0))
-            auc_scores.update(auc_score, target.size(0))
+        mae_error = mae(output_flatten[valid_idx], target_flatten[valid_idx])
+        losses.update(loss.data.cpu().item(), target.size(0))
+        mae_errors.update(mae_error.cpu().item(), target.size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -276,160 +341,102 @@ def train(train_loader, model, criterion, optimizer, epoch, normalizer):
         end = time.time()
 
         if i % args.print_freq == 0:
-            if args.task == 'regression':
-                print('Epoch: [{0}][{1}/{2}]\t'
-                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                      'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                      'MAE {mae_errors.val:.3f} ({mae_errors.avg:.3f})'.format(
-                    epoch, i, len(train_loader), batch_time=batch_time,
-                    data_time=data_time, loss=losses, mae_errors=mae_errors)
-                )
-            else:
-                print('Epoch: [{0}][{1}/{2}]\t'
-                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                      'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                      'Accu {accu.val:.3f} ({accu.avg:.3f})\t'
-                      'Precision {prec.val:.3f} ({prec.avg:.3f})\t'
-                      'Recall {recall.val:.3f} ({recall.avg:.3f})\t'
-                      'F1 {f1.val:.3f} ({f1.avg:.3f})\t'
-                      'AUC {auc.val:.3f} ({auc.avg:.3f})'.format(
-                    epoch, i, len(train_loader), batch_time=batch_time,
-                    data_time=data_time, loss=losses, accu=accuracies,
-                    prec=precisions, recall=recalls, f1=fscores,
-                    auc=auc_scores)
-                )
+            print('Epoch: [{0}][{1}/{2}]\t'
+                    'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                    'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                    'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                    'MAE {mae_errors.val:.3f}  ({mae_errors.avg:.3f})'.format(
+                epoch, i, len(train_loader), batch_time=batch_time,
+                data_time=data_time, loss=losses, mae_errors=mae_errors)
+            )
 
+    return losses.avg, mae_errors.avg
 
-def validate(val_loader, model, criterion, normalizer, test=False):
+def validate(val_loader, model, criterion, normalizer, args, test=False):
+
     batch_time = AverageMeter()
     losses = AverageMeter()
-    if args.task == 'regression':
-        mae_errors = AverageMeter()
-    else:
-        accuracies = AverageMeter()
-        precisions = AverageMeter()
-        recalls = AverageMeter()
-        fscores = AverageMeter()
-        auc_scores = AverageMeter()
+    mae_errors = AverageMeter()
+    
     if test:
         test_targets = []
         test_preds = []
-        test_cif_ids = []
+        test_ids = []
 
     # switch to evaluate mode
     model.eval()
 
     end = time.time()
-    for i, (input, target, batch_cif_ids) in enumerate(val_loader):
-        if args.cuda:
-            with torch.no_grad():
-                input_var = (Variable(input[0].cuda(non_blocking=True)),
-                             Variable(input[1].cuda(non_blocking=True)),
-                             input[2].cuda(non_blocking=True),
-                             [crys_idx.cuda(non_blocking=True) for crys_idx in input[3]])
-        else:
-            with torch.no_grad():
-                input_var = (Variable(input[0]),
-                             Variable(input[1]),
-                             input[2],
-                             input[3])
-        if args.task == 'regression':
-            target_normed = normalizer.norm(target)
-        else:
-            target_normed = target.view(-1).long()
-        if args.cuda:
-            with torch.no_grad():
-                target_var = Variable(target_normed.cuda(non_blocking=True))
-        else:
-            with torch.no_grad():
-                target_var = Variable(target_normed)
+    for i, (inputs, target, batch_ids) in enumerate(val_loader):
 
-        # compute output
-        output = model(*input_var)
-        loss = criterion(output, target_var)
+        input_var = (
+            inputs[0].to(device),
+            inputs[1].to(device),
+            inputs[2].to(device),
+            [crys_idx.to(device) for crys_idx in inputs[3]]
+        )
+
+        target_normed = normalizer.norm(target)
+
+        target_var = target_normed.to(device)
+
+        # Compute output
+        output, atom_fea = model(*input_var)
+        output = torch.cat(output)
+        
+        # calculate loss with nans removed
+        output_flatten = torch.flatten(output)
+        target_flatten = torch.flatten(target_var)
+        valid_idx = torch.bitwise_not(torch.isnan(target_flatten))
+
+        loss = criterion(output_flatten[valid_idx], target_flatten[valid_idx])
 
         # measure accuracy and record loss
-        if args.task == 'regression':
-            mae_error = mae(normalizer.denorm(output.data.cpu()), target)
-            losses.update(loss.data.cpu().item(), target.size(0))
-            mae_errors.update(mae_error, target.size(0))
-            if test:
-                test_pred = normalizer.denorm(output.data.cpu())
-                test_target = target
-                test_preds += test_pred.view(-1).tolist()
-                test_targets += test_target.view(-1).tolist()
-                test_cif_ids += batch_cif_ids
-        else:
-            accuracy, precision, recall, fscore, auc_score = \
-                class_eval(output.data.cpu(), target)
-            losses.update(loss.data.cpu().item(), target.size(0))
-            accuracies.update(accuracy, target.size(0))
-            precisions.update(precision, target.size(0))
-            recalls.update(recall, target.size(0))
-            fscores.update(fscore, target.size(0))
-            auc_scores.update(auc_score, target.size(0))
-            if test:
-                test_pred = torch.exp(output.data.cpu())
-                test_target = target
-                assert test_pred.shape[1] == 2
-                test_preds += test_pred[:, 1].tolist()
-                test_targets += test_target.view(-1).tolist()
-                test_cif_ids += batch_cif_ids
+        mae_error = mae(output_flatten[valid_idx], target_flatten[valid_idx])
+        losses.update(loss.data.cpu().item(), target.size(0))
+        mae_errors.update(mae_error.cpu().item(), target.size(0))
+        
+        if test:
+            test_pred = normalizer.denorm(output.data.cpu())
+            test_target = target
+            test_preds += [test_pred[i] for i in inputs[3]]
+            test_targets += [test_target[i] for i in inputs[3]]
+            test_ids += batch_ids
 
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
 
         if i % args.print_freq == 0:
-            if args.task == 'regression':
-                print('Test: [{0}/{1}]\t'
-                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                      'MAE {mae_errors.val:.3f} ({mae_errors.avg:.3f})'.format(
-                    i, len(val_loader), batch_time=batch_time, loss=losses,
-                    mae_errors=mae_errors))
-            else:
-                print('Test: [{0}/{1}]\t'
-                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                      'Accu {accu.val:.3f} ({accu.avg:.3f})\t'
-                      'Precision {prec.val:.3f} ({prec.avg:.3f})\t'
-                      'Recall {recall.val:.3f} ({recall.avg:.3f})\t'
-                      'F1 {f1.val:.3f} ({f1.avg:.3f})\t'
-                      'AUC {auc.val:.3f} ({auc.avg:.3f})'.format(
-                    i, len(val_loader), batch_time=batch_time, loss=losses,
-                    accu=accuracies, prec=precisions, recall=recalls,
-                    f1=fscores, auc=auc_scores))
+            print('Test: [{0}/{1}]\t'
+                    'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                    'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                    'MAE {mae_errors.val:.3f} ({mae_errors.avg:.3f})'.format(
+                i, len(val_loader), batch_time=batch_time, loss=losses,
+                mae_errors=mae_errors))
 
     if test:
         star_label = '**'
-        import csv
-        with open('test_results.csv', 'w') as f:
-            writer = csv.writer(f)
-            for cif_id, target, pred in zip(test_cif_ids, test_targets,
-                                            test_preds):
-                writer.writerow((cif_id, target, pred))
-    else:
-        star_label = '*'
-    if args.task == 'regression':
         print(' {star} MAE {mae_errors.avg:.3f}'.format(star=star_label,
                                                         mae_errors=mae_errors))
-        return mae_errors.avg
+        return test_targets, test_preds, test_ids
     else:
-        print(' {star} AUC {auc.avg:.3f}'.format(star=star_label,
-                                                 auc=auc_scores))
-        return auc_scores.avg
-
+        star_label = '*'
+    
+    print(' {star} MAE {mae_errors.avg:.3f}'.format(star=star_label,
+                                                        mae_errors=mae_errors))
+    return losses.avg, mae_errors.avg
 
 class Normalizer(object):
     """Normalize a Tensor and restore it later. """
 
     def __init__(self, tensor):
         """tensor is taken as a sample to calculate the mean and std"""
-        self.mean = torch.mean(tensor)
-        self.std = torch.std(tensor)
+    
+        tensor_flatten = torch.flatten(tensor)
+        valid_idx = torch.bitwise_not(torch.isnan(tensor_flatten))
+        self.mean = torch.mean(tensor_flatten[valid_idx])
+        self.std = torch.std(tensor_flatten[valid_idx])
 
     def norm(self, tensor):
         return (tensor - self.mean) / self.std
@@ -445,7 +452,6 @@ class Normalizer(object):
         self.mean = state_dict['mean']
         self.std = state_dict['std']
 
-
 def mae(prediction, target):
     """
     Computes the mean absolute error between prediction and target
@@ -457,24 +463,6 @@ def mae(prediction, target):
     target: torch.Tensor (N, 1)
     """
     return torch.mean(torch.abs(target - prediction))
-
-
-def class_eval(prediction, target):
-    prediction = np.exp(prediction.numpy())
-    target = target.numpy()
-    pred_label = np.argmax(prediction, axis=1)
-    target_label = np.squeeze(target)
-    if not target_label.shape:
-        target_label = np.asarray([target_label])
-    if prediction.shape[1] == 2:
-        precision, recall, fscore, _ = metrics.precision_recall_fscore_support(
-            target_label, pred_label, average='binary')
-        auc_score = metrics.roc_auc_score(target_label, prediction[:, 1])
-        accuracy = metrics.accuracy_score(target_label, pred_label)
-    else:
-        raise NotImplementedError
-    return accuracy, precision, recall, fscore, auc_score
-
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""
@@ -509,5 +497,168 @@ def adjust_learning_rate(optimizer, epoch, k):
         param_group['lr'] = lr
 
 
-if __name__ == '__main__':
-    main()
+def main(args):
+    
+    global best_mae_error, WORKDIR
+
+    set_seed(args.seed) # set torch, python, etc. seeds
+
+    # load data
+    data = pkl.load(open(args.data, 'rb'))
+    samples = [[id_, struct] for id_, struct in data.items()]
+
+    dataset = PerSiteData(samples, args.site_prop, WORKDIR, args.data_cache, random_seed=args.seed)
+    collate_fn = collate_pool
+    train_loader, val_loader, test_loader = get_train_val_test_loader(
+        dataset=dataset,
+        collate_fn=collate_fn,
+        batch_size=args.batch_size,
+        train_ratio=args.train_ratio,
+        num_workers=args.workers,
+        val_ratio=args.val_ratio,
+        test_ratio=args.test_ratio,
+        return_test=True)
+
+    if len(dataset) < 500:
+        warnings.warn('Dataset has less than 500 data points. '
+                  'Lower accuracy is expected. ')
+        sample_data_list = [dataset[i] for i in range(len(dataset))]
+    else:
+        sample_data_list = [dataset[i] for i in
+                        sample(range(len(dataset)), 500)]
+    _, sample_target, _ = collate_pool(sample_data_list)
+    normalizer = Normalizer(sample_target)
+
+
+    structures, _, _ = dataset[0]
+    orig_atom_fea_len = structures[0].shape[-1]
+    nbr_fea_len = structures[1].shape[-1]
+    model = PerSiteCGCNet(orig_atom_fea_len, nbr_fea_len, len(args.site_prop),
+                            atom_fea_len=args.atom_fea_len,
+                            n_conv=args.n_conv,
+                            h_fea_len=args.h_fea_len,
+                            n_h=args.n_h)
+    param_list = []
+    param_list.append(model.fc_out.weight.detach().cpu().numpy())
+
+    model.cuda()
+
+    # define loss func and optimizer
+    criterion = nn.MSELoss()
+
+    if args.optim == 'SGD':
+        optimizer = optim.SGD(model.parameters(), args.lr,
+                          momentum=args.momentum,
+                          weight_decay=args.weight_decay)
+    elif args.optim == 'Adam':
+        optimizer = optim.Adam(model.parameters(), args.lr,
+                           weight_decay=args.weight_decay)
+    else:
+        raise NameError('Only SGD or Adam is allowed as --optim')
+
+    # optionally resume from a checkpoint
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print("=> loading checkpoint '{}'".format(args.resume))
+            checkpoint = torch.load(args.resume)
+            args.start_epoch = checkpoint['epoch']
+            best_mae_error = checkpoint['best_mae_error']
+            model.load_state_dict(checkpoint['state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            normalizer.load_state_dict(checkpoint['normalizer'])
+            print("=> loaded checkpoint '{}' (epoch {})"
+                  .format(args.resume, checkpoint['epoch']))
+        else:
+            print("=> no checkpoint found at '{}'".format(args.resume))
+
+    # set scheduler
+    if args.sched == "cos_anneal":
+        print("Cosine anneal scheduler")
+        scheduler = CosineAnnealingLR(optimizer, args.lr_update_rate)
+    elif args.sched == "cos_anneal_warm_restart":
+        print("Cosine anneal with warm restarts scheduler")
+        scheduler = CosineAnnealingWarmRestarts(optimizer, arhs.lr_update_rate)
+    elif args.sched == "reduce_on_plateau":
+        print("Reduce on plateau scheduler")
+        scheduler = ReduceLROnPlateau(optimizer, 'min')
+    else:
+        print("Multi-step scheduler")
+        lr_milestones = np.arange(args.lr_update_rate,args.epochs+args.lr_update_rate,args.lr_update_rate)
+        scheduler = MultiStepLR(optimizer, milestones=lr_milestones,
+                        gamma=0.1)
+
+    # train model
+    train_losses = []
+    train_mae_errors = []
+    val_losses = []
+    val_mae_errors = []
+
+    for epoch in range(args.start_epoch, args.epochs):
+
+        # train for one epoch
+        train_loss, train_mae_error = train(train_loader, model, criterion, optimizer, epoch, normalizer, args)
+        train_losses.append(train_loss)
+        train_mae_errors.append(train_mae_error)
+
+        # evaluate on validation set
+        val_loss, val_mae_error = validate(val_loader, model, criterion, normalizer, args)
+        val_losses.append(val_loss)
+        val_mae_errors.append(val_mae_error)
+
+        if val_mae_error != val_mae_error:
+            print('Exit due to NaN')
+            sys.exit(1)
+
+        scheduler.step()
+
+        # Remember the best mae_error and save checkpoint
+        is_best = val_mae_error < best_mae_error
+        best_mae_error = min(val_mae_error, best_mae_error)
+        save_checkpoint({
+            'epoch': epoch + 1,
+            'state_dict': model.state_dict(),
+            'best_mae_error': best_mae_error,
+            'optimizer': optimizer.state_dict(),
+            'normalizer': normalizer.state_dict(),
+            'args': vars(args)
+        }, is_best)
+
+        # Evaluate when to end training on account of no MAE improvement
+        count = 0
+        if is_best:
+            count = 0
+        else:
+            count += 1
+        if count > args.lr_update_rate*1.5 and count > 15:
+            break
+
+    # load the best model
+    best_checkpoint = torch.load('model_best.pth.tar')
+    model.load_state_dict(best_checkpoint['state_dict'])
+    
+
+    # test model
+    train_targets, train_preds, train_ids = validate(train_loader, model, criterion, normalizer, args, test=True)
+    val_targets, val_preds, val_ids = validate(val_loader, model, criterion, normalizer, args, test=True)
+    #return get_val_mae(val_targets, val_preds, val_ids)
+
+    test_targets, test_preds, test_ids = validate(test_loader, model, criterion, normalizer, args, test=True)
+    # Save Test Results
+    pkl.dump(test_ids, open(f"test_ids.pkl", "wb"))
+    pkl.dump(test_preds, open(f"test_preds.pkl", "wb"))
+    pkl.dump(test_targets, open(f"test_targs.pkl", "wb"))
+    
+    pkl.dump(train_ids, open(f"train_ids.pkl", "wb"))
+    pkl.dump(train_preds, open(f"train_preds.pkl", "wb"))
+    pkl.dump(train_targets, open(f"train_targs.pkl", "wb"))
+    
+    pkl.dump(val_ids, open(f"val_ids.pkl", "wb"))
+    pkl.dump(val_preds, open(f"val_preds.pkl", "wb"))
+    pkl.dump(val_targets, open(f"val_targs.pkl", "wb"))
+
+args = Args(data='data/all_combined_clean_surface_and_bulk_no_benchmark_newref.pkl')
+#args = Args(data='data/bulk_dos_newref.pkl')
+#args = Args(data='data/bulk_bader_smaller.pkl')
+#args = Args(data='data/bulk_phonons.pkl')
+
+mae = main(args)
